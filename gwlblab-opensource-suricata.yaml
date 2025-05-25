@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  EC2 Deployment for the Suricata Stack.
+
+# ======================================================================================================================
+#   Parameters
+# ======================================================================================================================
+
+Parameters:
+
+# ----------------------------------------------------------------------------------------------------------------------
+#   Passed Pramaters from Main Stack
+# ----------------------------------------------------------------------------------------------------------------------
+
+  #Desired Stack Name
+  GlobalStackName:
+    Description: Stackname that you would like to uniquely identify your resources.
+    Type: String
+
+  #Amazon EC2 Latest Parameter ID
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    
+  #Security VPC Parameters
+  # SecurityVPC: 
+  #   Type: AWS::EC2::VPC::Id
+  #   Description: 'The VPC ID'
+  SecurityVPCCIDR:
+    Type: String
+    Description: Provide a/16 CIDR space.
+  SecurityVPCVMSeriesDataSubnetAZ1: 
+    Type: AWS::EC2::Subnet::Id
+    Description: 'The Subnet ID of the Data Subnet in AZ1'
+  SecurityVPCVMSeriesDataSubnetAZ2: 
+    Type: AWS::EC2::Subnet::Id
+    Description: 'The Subnet ID of the Data Subnet in AZ2'
+  SecurityVPCNATGWSubnetAZ1: 
+    Type: AWS::EC2::Subnet::Id
+    Description: 'Security VPC NAT Gateway Subnet in AZ1'
+  SecurityVPCNATGWSubnetAZ2: 
+    Type: AWS::EC2::Subnet::Id
+    Description: 'Security VPC NAT Gateway Subnet in AZ2'
+  SecurityVPCVMSeriesManagementSecurityGroup: 
+    Type: String
+    Description: 'Security Group for Management interfaces on VMSeries Instances'
+  SecurityVPCVMSeriesDataSecurityGroup: 
+    Type: String
+    Description: 'Security Group for Data Interfaces on VMSeries Instances'
+
+  #IAM Role
+  VMSeriesInstanceProfile: 
+    Type: String
+    Description: 'Instance Profile for VPCs'
+
+  #Management Network CIDR
+  RemoteManagementCIDR:
+    Description: >-
+      Remote Management CIDR to be allowed management access to VM-Series Firewall (e.g. 192.168.0.0/25)
+    Type: String
+
+  #EC2 key pair for the deployment
+  EC2KeyPair:
+    Description: >-
+      AWS EC2 Instance Key Pair for authentication to the VM-Series Firewalls.
+    Type: AWS::EC2::KeyPair::KeyName
+
+# ======================================================================================================================
+#   Resources
+# ======================================================================================================================
+
+Resources:
+
+# ----------------------------------------------------------------------------------------------------------------------
+#   Suricata 01
+# ----------------------------------------------------------------------------------------------------------------------
+
+  SuricataManagement01ENIAZ1:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      Description: Suricata-Management-01-ENI
+      GroupSet: [ !Ref SecurityVPCVMSeriesManagementSecurityGroup ]
+      SubnetId: !Ref SecurityVPCNATGWSubnetAZ1
+      PrivateIpAddress: "10.0.6.55"
+      Tags:
+        - Key: Name
+          Value: !Join [ '-' , [ !Ref "GlobalStackName", 'Suricata-Management-01-AZ1'] ]
+
+  SuricataManagementEIPAZ1:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Join [ '-' , [ !Ref "GlobalStackName", 'Suricata-Management-01-AZ1'] ]
+
+  SuricataManagementEIPAssociationAZ1:
+    Type: AWS::EC2::EIPAssociation
+    DependsOn: SuricataManagementEIPAZ1
+    Properties:
+      AllocationId: !GetAtt SuricataManagementEIPAZ1.AllocationId
+      NetworkInterfaceId: !Ref SuricataManagement01ENIAZ1
+
+  SuricataData01ENIAZ1:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      Description: Suricata-Data-01-AZ1
+      SourceDestCheck: No
+      GroupSet: [ !Ref SecurityVPCVMSeriesDataSecurityGroup ]
+      SubnetId: !Ref SecurityVPCVMSeriesDataSubnetAZ1
+      PrivateIpAddress: "10.0.4.55"
+      Tags:
+        - Key: Name
+          Value: !Join [ '-' , [ !Ref "GlobalStackName", 'Suricata-Data-01-AZ1'] ]
+
+  Suricata01EC2AZ1:
+    Type: AWS::EC2::Instance
+    DependsOn: 
+      - SuricataData01ENIAZ1
+      - SuricataManagementEIPAssociationAZ1
+      - SuricataManagementEIPAZ1
+      - SuricataManagement01ENIAZ1
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t2.micro
+      KeyName: !Ref EC2KeyPair
+      IamInstanceProfile: !Ref VMSeriesInstanceProfile
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref SuricataData01ENIAZ1
+          DeviceIndex: '0'
+        - NetworkInterfaceId: !Ref SuricataManagement01ENIAZ1
+          DeviceIndex: '1'
+      UserData: 
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          echo "USER DATA START"
+          
+          sudo -s
+          sed -i '/DEFROUTE=no/d' /etc/sysconfig/network-scripts/ifcfg-eth1
+          echo DEFROUTE=yes >> /etc/sysconfig/network-scripts/ifcfg-eth1
+          service network restart
+
+          # Installing of Updates
+          echo "Installing Necessary Updates"
+          yum update -y
+          amazon-linux-extras install epel -y
+          yum -y install gcc libpcap-devel pcre-devel libyaml-devel file-devel zlib-devel jansson-devel nss-devel libcap-ng-devel libnet-devel tar make libnetfilter_queue-devel lua-devel PyYAML libmaxminddb-devel lz4-devel supervisor gzip
+          pip3 install pyaml
+
+          # Installing libmaxminddb
+          wget https://github.com/maxmind/libmaxminddb/releases/download/1.12.2/libmaxminddb-1.12.2.tar.gz
+          tar -xzvf libmaxminddb-1.12.2.tar.gz
+          cd libmaxminddb-1.12.2
+          ./configure
+          make
+          make check
+          make install
+          ldconfig
+          cd ~
+
+          # Installing Rust
+          echo "Installing Rust"
+          curl https://sh.rustup.rs -sSf | sh -s -- --profile minimal --no-modify-path -y
+
+          # Defining Home Path
+          export PATH="/root/.cargo/bin:$PATH"
+          source "/root/.cargo/env"
+
+          #Downloading and installing Suricata
+          if [ ! -d "/tmp/suricata-7.0.8" ]; then
+              echo "Downloading and Creating Suricata Folder"
+              curl -s https://www.openinfosecfoundation.org/download/suricata-7.0.8.tar.gz -o /tmp/suricata-7.0.8.tar.gz
+              tar -zxvf /tmp/suricata-7.0.8.tar.gz -C /tmp/
+          else
+              echo "Suricata Folder Already Created"
+          fi
+
+          # Configuring Suricata
+          echo "Configuring Suricata"
+          cd /tmp/suricata-7.0.8/
+          # Install missing pcre2-devel
+          yum -y install pcre2-devel
+          ./configure --prefix=/usr/ --sysconfdir=/etc --localstatedir=/var/ --enable-lua --enable-geoip --enable-nfqueue
+          echo "Configuring Make"
+          make
+          sudo sh -c "echo /usr/local/lib  >> /etc/ld.so.conf.d/local.conf"
+          echo "Configuring ldconfig"
+          ldconfig
+          echo "Configuring Full Install"
+          make install-full
+
+          #Configures Suricata Service
+          echo "Configuring systemctl configurations"
+          cp /tmp/suricata-7.0.8/etc/suricata.service /etc/systemd/system/suricata.service
+          sed -i "/ExecStart=/c\ExecStart=/bin/suricata -c /etc/suricata/suricata.yaml --pidfile /var/run/suricata.pid -q 0" /etc/systemd/system/suricata.service
+          mv /var/lib/suricata/rules/suricata.rules /tmp/suricata-7.0.8/rulebackup.rules
+          cat /dev/null > /var/lib/suricata/rules/suricata.rules
+
+          #Initialise Suricata
+          echo "Initialise Suricata"
+          systemctl daemon-reload
+          ldconfig
+
+          echo "Suricata Successfully Installed"
+      Tags:
+        - Key: Name
+          Value: !Sub ${GlobalStackName}-Suricata-01-AZ1
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+#   Suricata 02
+# ----------------------------------------------------------------------------------------------------------------------
+
+  # SuricataManagement02ENIAZ2:
+  #   Type: AWS::EC2::NetworkInterface
+  #   Properties:
+  #     Description: Suricata-Management-02-ENI
+  #     GroupSet: [ !Ref SecurityVPCVMSeriesManagementSecurityGroup ]
+  #     SubnetId: !Ref SecurityVPCNATGWSubnetAZ2
+  #     PrivateIpAddress: "10.0.7.55"
+  #     Tags:
+  #       - Key: Name
+  #         Value: !Join [ '-' , [ !Ref "GlobalStackName", 'Suricata-Management-02-AZ2'] ]
+
+  # SuricataManagementEIPAZ2:
+  #   Type: AWS::EC2::EIP
+  #   Properties:
+  #     Domain: vpc
+  #     Tags:
+  #       - Key: Name
+  #         Value: !Join [ '-' , [ !Ref "GlobalStackName", 'Suricata-Management-02-AZ2'] ]
+
+  # SuricataManagementEIPAssociationAZ2:
+  #   Type: AWS::EC2::EIPAssociation
+  #   DependsOn: SuricataManagementEIPAZ2
+  #   Properties:
+  #     AllocationId: !GetAtt SuricataManagementEIPAZ2.AllocationId
+  #     NetworkInterfaceId: !Ref SuricataManagement02ENIAZ2
+
+  # SuricataData02ENIAZ2:
+  #   Type: AWS::EC2::NetworkInterface
+  #   Properties:
+  #     Description: Suricata-Data-02-AZ2
+  #     SourceDestCheck: No
+  #     GroupSet: [ !Ref SecurityVPCVMSeriesDataSecurityGroup ]
+  #     SubnetId: !Ref SecurityVPCVMSeriesDataSubnetAZ2
+  #     PrivateIpAddress: "10.0.5.55"
+  #     Tags:
+  #       - Key: Name
+  #         Value: !Join [ '-' , [ !Ref "GlobalStackName", 'Suricata-Data-02-AZ2'] ]
+
+  # Suricata02EC2AZ2:
+  #   Type: AWS::EC2::Instance
+  #   DependsOn: 
+  #     - SuricataData02ENIAZ2
+  #     - SuricataManagementEIPAssociationAZ2
+  #     - SuricataManagementEIPAZ2
+  #     - SuricataManagement02ENIAZ2
+  #   Properties:
+  #     ImageId: !Ref LatestAmiId
+  #     InstanceType: t2.micro
+  #     KeyName: !Ref EC2KeyPair
+  #     IamInstanceProfile: !Ref VMSeriesInstanceProfile
+  #     NetworkInterfaces:
+  #       - NetworkInterfaceId: !Ref SuricataManagement02ENIAZ2
+  #         DeviceIndex: '0'
+  #       - NetworkInterfaceId: !Ref SuricataData02ENIAZ2
+  #         DeviceIndex: '1'
+  #     Tags:
+  #       - Key: Name
+  #         Value: !Sub ${GlobalStackName}-Suricata-02-AZ2
+
+
+
+# ======================================================================================================================
+#   Outputs
+# ======================================================================================================================
+
+#Outputs:
